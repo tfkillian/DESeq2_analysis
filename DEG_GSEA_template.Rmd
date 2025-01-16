@@ -1,0 +1,285 @@
+---
+title: "GO term enrichment of DESeq2 differentially expressed genes"
+author: "Theo Killian"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+```{r, echo = FALSE, results = 'asis'}
+suppressPackageStartupMessages(library("dplyr"))
+knitr::opts_chunk$set(collapse=TRUE, comment="#>", warning=FALSE, message=FALSE)
+```
+
+# Introduction
+
+This report describes the downstream analysis of differentially expressed genes
+(DEGs) from a [DESeq2](https://bioconductor.org/packages/release/bioc/html/DESeq2.html)
+comparison. This analysis performs gene ontology enrichment analysis (GSEA) using
+[fgsea](https://bioconductor.org/packages/release/bioc/html/fgsea.html) on the
+list of DEGs and visualizes the enrichment of gene sets found to be significant,
+and finally saving the results to Excel files.
+
+```{r load_libraries, warning=FALSE, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(GO.db)
+library(hypeR)
+library(org.Mm.eg.db)
+library(readxl)
+library(writexl)
+library(DT)
+library(fgsea)
+library(PPInfer)
+```
+
+The pathway gene sets are loaded using the `hypeR::msigdb_gsets` function that
+imports gene ontology (GO) terms and KEGG pathways that are linked to gene
+symbols, which are downloaded from the [Molecular Signatures Database (MSigDB)](https://www.gsea-msigdb.org/gsea/msigdb/):
+
+1. GO biological process terms (i.e. "GO BP")
+2. GO cellular component (i.e. "GO CC")
+3. GO molecular function (i.e. "GO MF")
+4. KEGG pathways (i.e. "Kyoto Encyclopedia of Genes and Genomes")
+
+```{r}
+set.seed(123)
+# proj <- "ZINBWaVE_DESeq2"
+# sel_comp <- "axon"
+sp <- "Mus musculus"
+GO_BP <- hypeR::msigdb_gsets(species = sp, category = "C5", subcategory = "BP")
+GO_CC <- hypeR::msigdb_gsets(species = sp, category = "C5", subcategory = "CC")
+GO_MF <- hypeR::msigdb_gsets(species = sp, category = "C5", subcategory = "MF")
+KEGG <- hypeR::msigdb_gsets(species = sp, category = "C2", subcategory = "CP:KEGG")
+```
+
+## Creation of ranked DE list prior to GSEA
+
+DE genes are weighted by a combination of `-log10(pvalue) * sign(log2FoldChange)`,
+and sorted in order of descending weights:
+
+```{r warning=FALSE, message=FALSE}
+rank_list <- read_excel(path = paste0(
+    "./data/Excel/DESeq2_res_2024-08-14.xlsx"
+  )) %>%
+  rename(gene_name = genes) %>%
+  filter(
+    !is.na(gene_name),
+    !duplicated(gene_name),
+    !is.na(log2FoldChange),
+    !is.na(pvalue)
+  ) %>%
+  mutate(weighted_score = -log10(pvalue) * sign(log2FoldChange)) %>%
+  arrange(desc(weighted_score)) %>%
+  select(gene_name, weighted_score) %>%
+  tibble::deframe()
+
+# Preview top entries
+head(rank_list, 20)
+```
+
+## Perform GSEA 
+
+GSEA is performed below using [fgsea::fgseaMultilevel](https://rdrr.io/bioc/fgsea/man/fgseaMultilevel.html)
+n GO BP, CC, MF, and KEGG separately. For clarity, we store each result in a descriptive variable:
+
+```{r warning=FALSE, message=FALSE}
+# Define a helper function for GSEA
+run_fgsea <- function(pathways, stats_vec) {
+  fgseaMultilevel(
+    pathways    = pathways,
+    stats       = stats_vec,
+    minSize     = 1,
+    maxSize     = Inf,
+    eps         = 0,
+    nPermSimple = 1000
+  )
+}
+
+GO_BP_GSEA  <- run_fgsea(GO_BP$genesets,  rank_list)
+GO_CC_GSEA  <- run_fgsea(GO_CC$genesets,  rank_list)
+GO_MF_GSEA  <- run_fgsea(GO_MF$genesets,  rank_list)
+KEGG_GSEA   <- run_fgsea(KEGG$genesets,   rank_list)
+```
+
+## Visualizations
+
+Bar plots containing the top 30 most significant GO and KEGG terms are shown below.
+These plots are colored by
+[normalized enrichment score](https://www.gsea-msigdb.org/gsea/doc/GSEAUserGuideTEXT.htm#_Normalized_Enrichment_Score),
+(i.e. "NES"). The NES is the primary statistic for examining gene set enrichment
+results. By normalizing the enrichment score, GSEA accounts for differences in
+gene set size and in correlations between gene sets and the expression dataset.
+Therefore, the NES can be used to compare analysis results across gene sets.
+
+*Note: the red dotted line denotes the threshold of significance (i.e. p-adjusted value < 0.05)"*
+
+```{r fig.width=10, warning=FALSE, message=FALSE}
+GO_BP_GSEA %>%
+  PPInfer::GSEA.barplot(
+    category = "pathway", score = "NES",
+    top = 15, pvalue = "padj", sort = "padj", numChar = 100
+  ) +
+  geom_abline(
+    slope = 0, intercept = -log10(0.05),
+    color = "red", linetype = "dashed"
+  ) +
+  theme(
+    plot.margin = margin(10, 10, 10, 70),
+    axis.text.y = element_text(size = 9)
+  ) +
+  ggtitle(
+    paste0("GO BP terms ", gsub("_", " ", proj),
+           "\ncomparison")
+  )
+```
+
+```{r fig.width=10, warning=FALSE, message=FALSE}
+GO_CC_GSEA %>%
+  PPInfer::GSEA.barplot(
+    category = "pathway", score = "NES",
+    top = 15, pvalue = "padj", sort = "padj", numChar = 100
+  ) +
+  geom_abline(
+    slope = 0, intercept = -log10(0.05),
+    color = "red", linetype = "dashed"
+  ) +
+  theme(
+    plot.margin = margin(10, 10, 10, 70),
+    axis.text.y = element_text(size = 9)
+  ) +
+  ggtitle(
+    paste0("GO CC terms ", gsub("_", " ", proj),
+           "\ncomparison")
+  )
+```
+
+```{r fig.width=10, warning=FALSE, message=FALSE}
+GO_MF_GSEA %>%
+  PPInfer::GSEA.barplot(
+    category = "pathway", score = "NES",
+    top = 15, pvalue = "padj", sort = "padj", numChar = 100
+  ) +
+  geom_abline(
+    slope = 0, intercept = -log10(0.05),
+    color = "red", linetype = "dashed"
+  ) +
+  theme(
+    plot.margin = margin(10, 10, 10, 70),
+    axis.text.y = element_text(size = 9)
+  ) +
+  ggtitle(
+    paste0("GO MF terms ", gsub("_", " ", proj),
+           "\ncomparison")
+  )
+```
+
+```{r fig.width=10, warning=FALSE, message=FALSE}
+KEGG_GSEA %>%
+  PPInfer::GSEA.barplot(
+    category = "pathway", score = "NES",
+    top = 15, pvalue = "padj", sort = "padj", numChar = 100
+  ) +
+  geom_abline(
+    slope = 0, intercept = -log10(0.05),
+    color = "red", linetype = "dashed"
+  ) +
+  theme(
+    plot.margin = margin(10, 10, 10, 70),
+    axis.text.y = element_text(size = 9)
+  ) +
+  ggtitle(
+    paste0("KEGG terms ", gsub("_", " ", proj),
+           "\ncomparison")
+  )
+```
+
+## Tables of significant GO and KEGG terms
+
+Here, we show only terms passing a significance threshold of padj < 0.05,
+excluding the “leadingEdge” column for brevity. All terms—including leading-edge
+genes—will be saved to Excel.
+
+### Table of significant GO BP terms
+
+```{r warning=FALSE, message=FALSE}
+GO_BP_GSEA %>%
+  dplyr::mutate(leadingEdge = sapply(leadingEdge, function(x) paste(x, collapse = "; "))) %>%
+  dplyr::arrange(padj) %>%
+  as.data.frame() -> GO_BP_GSEA_res
+
+GO_BP_GSEA_res %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::select(-leadingEdge) %>%
+  DT::datatable()
+```
+
+### Table of significant GO CC terms
+
+```{r warning=FALSE, message=FALSE}
+GO_CC_GSEA %>%
+  dplyr::mutate(leadingEdge = sapply(leadingEdge, function(x) paste(x, collapse = "; "))) %>%
+  dplyr::arrange(padj) %>%
+  as.data.frame() -> GO_CC_GSEA_res
+
+GO_CC_GSEA_res %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::select(-leadingEdge) %>%
+  DT::datatable()
+```
+
+### Table of significant GO MF terms
+
+```{r warning=FALSE, message=FALSE}
+GO_MF_GSEA %>%
+  dplyr::mutate(leadingEdge = sapply(leadingEdge, function(x) paste(x, collapse = "; "))) %>%
+  dplyr::arrange(padj) %>%
+  as.data.frame() -> GO_MF_GSEA_res
+
+GO_MF_GSEA_res %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::select(-leadingEdge) %>%
+  DT::datatable()
+```
+
+### Table of significant KEGG pathways
+
+```{r warning=FALSE, message=FALSE}
+KEGG_GSEA %>%
+  dplyr::mutate(leadingEdge = sapply(leadingEdge, function(x) paste(x, collapse = "; "))) %>%
+  dplyr::arrange(padj) %>%
+  as.data.frame() -> KEGG_GSEA_res
+
+KEGG_GSEA_res %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::select(-leadingEdge) %>%
+  DT::datatable()
+```
+
+## Save results
+
+The results are saved as an Excel file containing with sheets named in the
+following order: `GO_BP`, `GO_CC`, `GO_MF`, `KEGG`. These lists of contain all
+GO and KEGG terms from each analysis, regardless of significance, and including
+the `leadingEdge`, which contains genes driving the enrichment of a particular
+term or pathway.
+
+```{r warning=FALSE, message=FALSE}
+f1 <- list(GO_BP_GSEA_res, GO_CC_GSEA_res, GO_MF_GSEA_res, KEGG_GSEA_res)
+names(f1) <- c("GO_BP", "GO_CC", "GO_MF", "KEGG")
+writexl::write_xlsx(x = f1,
+                    path = paste0("./data/", proj, "_", sel_comp,
+                                  "_sig_GO_KEGG_terms_", Sys.Date(), ".xlsx"))
+```
+
+*Session Info*
+
+```{r sessionInfo}
+sessionInfo()
+```
