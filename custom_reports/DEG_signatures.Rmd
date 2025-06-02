@@ -1,0 +1,597 @@
+---
+title: "Analysis of Gene Signatures in DE Results"
+author: "Theo Killian"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+```{r, echo = FALSE, results = 'asis'}
+# Set global knitr options
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  warning  = FALSE,
+  message  = FALSE
+)
+
+# Load required packages
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(stringr)
+  library(ggplot2)
+  library(ggrepel)
+  library(knitr)
+  library(RColorBrewer)
+  library(readxl)
+  library(writexl)
+  library(org.Mm.eg.db)
+  library(clusterProfiler)
+  library(fgsea)
+  library(DOSE)
+  library(DT)
+})
+
+# set project name
+project_name <- "karthik_mice_obesity"
+
+# Set seed for reproducibility
+set.seed(123)
+```
+
+# Introduction
+
+In order to understand the underlying biology of the DE genes generated from the
+earlier DESeq2 report, we will be comparing the significant DE genes to select
+gene signatures taken from the supplementary material found in
+[Karras, et al 2022](https://www.nature.com/articles/s41586-022-05242-7#Sec50).
+This report will generate volcano plots to visualize the expression of the 
+melanoma gene signature genes, annotate the DE gene list with the melanoma gene
+signatures and perform custom GSEA to rank the enrichment of melanoma gene
+signature genes within the DE results using [fgsea](https://www.bioconductor.org/packages/devel/bioc/vignettes/fgsea/inst/doc/fgsea-tutorial.html).
+
+## Read Signature File
+
+The supplementary file containing DE gene lists on sheet 3 of the Excel file from
+[Karras, et al 2022](https://www.nature.com/articles/s41586-022-05242-7#Sec50)
+is read below: 
+
+<!-- ```{r} -->
+<!-- readxl::read_excel("./data/41586_2022_5242_MOESM3_ESM.xlsx", -->
+<!--                    sheet = 1, -->
+<!--                    skip = 2) %>% -->
+<!--   dplyr::rename(gene_symbol = names(.)[1]) %>% -->
+<!--   dplyr::select(-gene) %>% -->
+<!--   # dplyr::mutate(signature_type = dplyr::case_when( -->
+<!--   #   cluster == 0 ~ "" -->
+<!--   #   # Stem-like	Neural Crest-like	Mesenchymal-like	RNA processing	Antigen Presentation	Stress-like (hypoxia) 	Melanocytic (Oxphos) -->
+<!--   # )) -->
+<!--   dplyr::filter(cluster == 4, -->
+<!--                 avg_logFC > 1) %>% -->
+<!--   as.data.frame() -> sig_sheet_1 -->
+<!-- # View(sig_sheet_1) -->
+<!-- ``` -->
+
+```{r}
+readxl::read_excel("./data/41586_2022_5242_MOESM3_ESM.xlsx",
+                   sheet = 3,
+                   skip = 2) %>%
+  as.data.frame() -> sig_sheet_3
+
+DT::datatable(sig_sheet_3)
+```
+
+## Annotate DE Genes with Melanoma Signature Genes
+
+```{r warning=FALSE, message=FALSE}
+res_data <- readRDS("./results/karthik_mice_obesity_DE_results_2025-05-18.rds")
+
+sig_sheet_3 %>% 
+  tidyr::pivot_longer(
+    cols = everything(),
+    names_to = "signature",
+    values_to = "gene_name") %>%
+  dplyr::filter(!is.na(gene_name)) %>%
+  as.data.frame() -> sig_list_long
+
+res_data %>%
+  dplyr::filter(!is.na(pvalue)) %>%
+  dplyr::mutate(
+    negLogP = -log10(pvalue),
+    sig = ifelse(padj < 0.05 & abs(log2FoldChange) > 1,
+                 "Significant", "Not Significant")) %>%
+  dplyr::left_join(sig_list_long, by = "gene_name") %>%
+  as.data.frame() -> res_data_annotated
+
+res_data_annotated %>%
+  dplyr::select(-c(contains("_rep"), contains("_id"), lfcSE, stat, sig, negLogP)) %>%
+  dplyr::mutate(
+    log2FoldChange = round(log2FoldChange, 3),
+    baseMean       = round(baseMean, 1),
+    pvalue         = signif(pvalue, 3),
+    padj           = signif(padj, 3)) %>%
+  dplyr::select(gene_name, signature, everything()) %>%
+  as.data.frame() -> res_data_annotated_table
+
+res_data_annotated_table %>%
+  dplyr::filter(stringr::str_length(signature) > 1) %>%
+  DT::datatable(
+    options = list(pageLength = 10),
+    caption = "Annotated Differential Expression Results of Melanoma Signature Genes: ")
+```
+
+**Of all the genes in the signature lists, only 3 genes in the "Mesenchymal-like" gene list appear in the significant results, and all of them are higher in the "IgG" condition.**
+
+```{r}
+res_data_annotated_table %>%
+  dplyr::filter(padj < 0.05,
+                stringr::str_length(signature) > 1) %>%
+  DT::datatable()
+```
+
+## GSEA With ClusterProfiler Using Defined Melanoma Signatures 
+
+We use the [fgsea](https://www.bioconductor.org/packages/devel/bioc/vignettes/fgsea/inst/doc/fgsea-tutorial.html)
+R package to perform GSEA on our custom melanoma signatures taken from the 
+supplementary tables in Karras, et al 2022.
+
+```{r warning=FALSE, message=FALSE}
+mouse_biomart <- readRDS(file = "./data/mouse_biomart.rds")
+sig_list_long %>%
+  dplyr::left_join(mouse_biomart, by = "gene_name") %>% 
+  dplyr::filter(!is.na(gene_name),
+                !is.na(entrez_id)) %>%
+  dplyr::select(-ensembl_id) %>%
+  dplyr::rename(SYMBOL = gene_name,
+                ENTREZID = entrez_id) %>%
+  as.data.frame() -> entrez_genes
+
+readRDS(file = "./results/karthik_mice_obesity_DE_results_2025-05-18.rds") %>%
+  dplyr::filter(
+    !is.na(gene_name),
+    !is.na(entrez_id),
+    !duplicated(gene_name),
+    !duplicated(entrez_id),
+    !is.na(log2FoldChange),
+    !is.na(pvalue)) %>%
+  dplyr::arrange(desc(stat)) %>%
+  dplyr::select(entrez_id, stat) %>%
+  dplyr::rename(ENTREZID = entrez_id) %>%
+  tibble::deframe() -> gene_list
+
+list(
+   entrez_genes %>% 
+    dplyr::filter(signature == unique(entrez_genes$signature)[1]) %>%
+    dplyr::mutate(ENTREZID = as.character(ENTREZID)) %>%
+    dplyr::pull(ENTREZID),
+  entrez_genes %>% 
+    dplyr::filter(signature == unique(entrez_genes$signature)[2]) %>%
+    dplyr::mutate(ENTREZID = as.character(ENTREZID)) %>%
+    dplyr::pull(ENTREZID),
+  entrez_genes %>% 
+    dplyr::filter(signature == unique(entrez_genes$signature)[3]) %>%
+    dplyr::mutate(ENTREZID = as.character(ENTREZID)) %>%
+    dplyr::pull(ENTREZID),
+  entrez_genes %>% 
+    dplyr::filter(signature == unique(entrez_genes$signature)[4]) %>%
+    dplyr::mutate(ENTREZID = as.character(ENTREZID)) %>%
+    dplyr::pull(ENTREZID),
+  entrez_genes %>% 
+    dplyr::filter(signature == unique(entrez_genes$signature)[5]) %>%
+    dplyr::mutate(ENTREZID = as.character(ENTREZID)) %>%
+    dplyr::pull(ENTREZID),
+  entrez_genes %>% 
+    dplyr::filter(signature == unique(entrez_genes$signature)[6]) %>%
+    dplyr::mutate(ENTREZID = as.character(ENTREZID)) %>%
+    dplyr::pull(ENTREZID),
+  entrez_genes %>% 
+    dplyr::filter(signature == unique(entrez_genes$signature)[7]) %>%
+    dplyr::mutate(ENTREZID = as.character(ENTREZID)) %>%
+    dplyr::pull(ENTREZID)) %>%
+  setNames(unique(entrez_genes$signature)) -> melanoma_gene_sets
+
+fgsea::fgsea(
+  pathways = melanoma_gene_sets,
+  stats = gene_list) %>% 
+  dplyr::arrange(padj) -> melanoma_gsea_res
+
+melanoma_gsea_res %>%
+  dplyr::mutate(
+    log2err = round(log2err, 3),
+    ES       = round(ES, 3),
+    NES       = round(NES, 3),
+    pval         = signif(pval, 3),
+    padj           = signif(padj, 3)) %>%
+  dplyr::select(-leadingEdge) %>%
+  DT::datatable()
+```
+
+```{r}
+plotGseaTable(melanoma_gene_sets, gene_list, melanoma_gsea_res, 
+              gseaParam=0.5)
+```
+
+## Volcano Plots
+
+We will be visualizing the following gene signatures shown below in volcano
+plots to visually illustrate what the genes in these melanoma signature gene sets
+are expressing with respect to each condition.
+
+<!-- ```{r} -->
+<!-- names(sig_sheet_3) %>% -->
+<!--   as.data.frame() %>%  -->
+<!--   dplyr::rename(Signatures = names(.)[1]) %>%  -->
+<!--   knitr::kable() -->
+<!-- ``` -->
+
+### Standard Volcano Plot
+
+A Volcano plot (log2 fold change vs -log10 p-value) helps identify genes that
+display large magnitude changes and high significance.
+
+**NOTE: This is the same volcano plot from the previous DE analysis; it is displayed here purely for reference!**
+
+```{r}
+res_data %>%
+  dplyr::filter(!is.na(pvalue)) %>%
+  dplyr::mutate(
+    negLogP = -log10(pvalue),
+    sig = ifelse(padj < 0.05 & abs(log2FoldChange) > 1,
+                 "Significant", "Not Significant")) -> volcano_data
+volcano_data %>%
+  ggplot(aes(x = log2FoldChange, y = negLogP, color = sig)) +
+  geom_point(size = 0.75, alpha = 0.75) +
+  geom_text_repel(data = subset(volcano_data, sig == "Significant"),
+                  aes(label = gene_name), size = 3, max.overlaps = Inf,
+                  box.padding = 0.3, point.padding = 0.3, segment.color = "grey50") +
+  scale_color_manual(values = c("Significant" = "red", "Not Significant" = "black")) +
+  geom_hline(yintercept = -log10(0.05), color = "blue", linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), color = "blue", linetype = "dashed") +
+  theme_bw() +
+  ggtitle("Volcano Plot")
+```
+
+### Volcano Plot Highlighting "Stem-like" Genes
+
+```{r}
+sig_sheet_3 %>% 
+  dplyr::filter(!is.na(`Stem-like`)) %>%
+  dplyr::pull(`Stem-like`) -> sig_list1
+
+res_data %>%
+  dplyr::filter(!is.na(pvalue)) %>%
+  dplyr::mutate(
+    negLogP = -log10(pvalue),
+    sig = ifelse(padj < 0.05 & abs(log2FoldChange) > 1,
+                 "Significant", "Not Significant"),
+    is_target = ifelse(gene_name %in% sig_list1, "Target", "Other")) %>%
+  as.data.frame() -> volcano_data
+
+ggplot(volcano_data, aes(x = log2FoldChange, y = negLogP)) +
+  geom_point(aes(color = is_target), size = 0.75, alpha = 0.75) +
+  scale_color_manual(values = c("Target" = "green3", "Other" = "black")) +
+  geom_text_repel(
+    data = subset(volcano_data, is_target == "Target"),
+    aes(label = gene_name),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.3,
+    point.padding = 0.3,
+    segment.color = "grey50",
+    color = "green3") +
+  geom_hline(yintercept = -log10(0.05), color = "blue", linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), color = "blue", linetype = "dashed") +
+  theme_bw() +
+  ggtitle(paste0("Volcano Plot Highlighting ", names(sig_sheet_3)[1], " Genes"))
+```
+
+### Volcano Plot Highlighting "Neural Crest-like" Genes
+
+```{r warning=FALSE, message=FALSE}
+sig_sheet_3 %>% 
+  dplyr::filter(!is.na(`Mesenchymal-like`)) %>%
+  dplyr::pull(`Neural Crest-like`) -> sig_list2
+
+res_data %>%
+  dplyr::filter(!is.na(pvalue)) %>%
+  dplyr::mutate(
+    negLogP = -log10(pvalue),
+    sig = ifelse(padj < 0.05 & abs(log2FoldChange) > 1,
+                 "Significant", "Not Significant"),
+    is_target = ifelse(gene_name %in% sig_list2, "Target", "Other")) %>%
+  as.data.frame() -> volcano_data
+
+ggplot(volcano_data, aes(x = log2FoldChange, y = negLogP)) +
+  geom_point(aes(color = is_target), size = 0.75, alpha = 0.75) +
+  scale_color_manual(values = c("Target" = "mistyrose4", "Other" = "black")) +
+  geom_text_repel(
+    data = subset(volcano_data, is_target == "Target"),
+    aes(label = gene_name),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.3,
+    point.padding = 0.3,
+    segment.color = "grey50",
+    color = "mistyrose4") +
+  geom_hline(yintercept = -log10(0.05), color = "blue", linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), color = "blue", linetype = "dashed") +
+  theme_bw() +
+  ggtitle(paste0("Volcano Plot Highlighting ", names(sig_sheet_3)[2], " Genes"))
+```
+
+### Volcano Plot Highlighting "Mesenchymal-like" Genes
+
+```{r}
+sig_sheet_3 %>% 
+  dplyr::filter(!is.na(`Mesenchymal-like`)) %>%
+  dplyr::pull(`Mesenchymal-like`) -> sig_list3
+
+res_data %>%
+  dplyr::filter(!is.na(pvalue)) %>%
+  dplyr::mutate(
+    negLogP = -log10(pvalue),
+    sig = ifelse(padj < 0.05 & abs(log2FoldChange) > 1,
+                 "Significant", "Not Significant"),
+    is_target = ifelse(gene_name %in% sig_list3, "Target", "Other")) %>%
+  as.data.frame() -> volcano_data
+
+ggplot(volcano_data, aes(x = log2FoldChange, y = negLogP)) +
+  geom_point(aes(color = is_target), size = 0.75, alpha = 0.75) +
+  scale_color_manual(values = c("Target" = "hotpink4", "Other" = "black")) +
+  geom_text_repel(
+    data = subset(volcano_data, is_target == "Target"),
+    aes(label = gene_name),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.3,
+    point.padding = 0.3,
+    segment.color = "grey50",
+    color = "hotpink4") +
+  geom_hline(yintercept = -log10(0.05), color = "blue", linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), color = "blue", linetype = "dashed") +
+  theme_bw() +
+  ggtitle(paste0("Volcano Plot Highlighting ", names(sig_sheet_3)[3], " Genes"))
+```
+
+### Volcano Plot Highlighting "RNA processing" Genes
+
+```{r}
+sig_sheet_3 %>% 
+  dplyr::filter(!is.na(`RNA processing`)) %>%
+  dplyr::pull(`RNA processing`) -> sig_list4
+
+res_data %>%
+  dplyr::filter(!is.na(pvalue)) %>%
+  dplyr::mutate(
+    negLogP = -log10(pvalue),
+    sig = ifelse(padj < 0.05 & abs(log2FoldChange) > 1,
+                 "Significant", "Not Significant"),
+    is_target = ifelse(gene_name %in% sig_list4, "Target", "Other")) %>%
+  as.data.frame() -> volcano_data
+
+ggplot(volcano_data, aes(x = log2FoldChange, y = negLogP)) +
+  geom_point(aes(color = is_target), size = 0.75, alpha = 0.75) +
+  scale_color_manual(values = c("Target" = "#008B8B", "Other" = "black")) +
+  geom_text_repel(
+    data = subset(volcano_data, is_target == "Target"),
+    aes(label = gene_name),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.3,
+    point.padding = 0.3,
+    segment.color = "grey50",
+    color = "#008B8B") +
+  geom_hline(yintercept = -log10(0.05), color = "blue", linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), color = "blue", linetype = "dashed") +
+  theme_bw() +
+  ggtitle(paste0("Volcano Plot Highlighting ", names(sig_sheet_3)[4], " Genes"))
+```
+
+### Volcano Plot Highlighting "Antigen Presentation" Genes
+
+```{r}
+sig_sheet_3 %>% 
+  dplyr::filter(!is.na(`Antigen Presentation`)) %>%
+  dplyr::pull(`Antigen Presentation`) -> sig_list5
+
+res_data %>%
+  dplyr::filter(!is.na(pvalue)) %>%
+  dplyr::mutate(
+    negLogP = -log10(pvalue),
+    sig = ifelse(padj < 0.05 & abs(log2FoldChange) > 1,
+                 "Significant", "Not Significant"),
+    is_target = ifelse(gene_name %in% sig_list5, "Target", "Other")) %>%
+  as.data.frame() -> volcano_data
+
+ggplot(volcano_data, aes(x = log2FoldChange, y = negLogP)) +
+  geom_point(aes(color = is_target), size = 0.75, alpha = 0.75) +
+  scale_color_manual(values = c("Target" = "#C71585", "Other" = "black")) +
+  geom_text_repel(
+    data = subset(volcano_data, is_target == "Target"),
+    aes(label = gene_name),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.3,
+    point.padding = 0.3,
+    segment.color = "grey50",
+    color = "#C71585") +
+  geom_hline(yintercept = -log10(0.05), color = "blue", linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), color = "blue", linetype = "dashed") +
+  theme_bw() +
+  ggtitle(paste0("Volcano Plot Highlighting ", names(sig_sheet_3)[5], " Genes"))
+```
+
+### Volcano Plot Highlighting "Stress-like (hypoxia)" Genes
+
+```{r}
+sig_sheet_3 %>% 
+  dplyr::filter(!is.na(`Stem-like`)) %>%
+  dplyr::pull(`Stem-like`) -> sig_list6
+
+res_data %>%
+  dplyr::filter(!is.na(pvalue)) %>%
+  dplyr::mutate(
+    negLogP = -log10(pvalue),
+    sig = ifelse(padj < 0.05 & abs(log2FoldChange) > 1,
+                 "Significant", "Not Significant"),
+    is_target = ifelse(gene_name %in% sig_list6, "Target", "Other")) %>%
+  as.data.frame() -> volcano_data
+
+ggplot(volcano_data, aes(x = log2FoldChange, y = negLogP)) +
+  geom_point(aes(color = is_target), size = 0.75, alpha = 0.75) +
+  scale_color_manual(values = c("Target" = "#B22222", "Other" = "black")) +
+  geom_text_repel(
+    data = subset(volcano_data, is_target == "Target"),
+    aes(label = gene_name),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.3,
+    point.padding = 0.3,
+    segment.color = "grey50",
+    color = "#B22222") +
+  geom_hline(yintercept = -log10(0.05), color = "blue", linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), color = "blue", linetype = "dashed") +
+  theme_bw() +
+  ggtitle(paste0("Volcano Plot Highlighting ", names(sig_sheet_3)[6], " Genes"))
+```
+
+### Volcano Plot Highlighting "Melanocytic (Oxphos)" Genes
+
+```{r}
+sig_sheet_3 %>% 
+  dplyr::filter(!is.na(`Melanocytic (Oxphos)`)) %>%
+  dplyr::pull(`Melanocytic (Oxphos)`) -> sig_list7
+
+res_data %>%
+  dplyr::filter(!is.na(pvalue)) %>%
+  dplyr::mutate(
+    negLogP = -log10(pvalue),
+    sig = ifelse(padj < 0.05 & abs(log2FoldChange) > 1,
+                 "Significant", "Not Significant"),
+    is_target = ifelse(gene_name %in% sig_list7, "Target", "Other")) %>%
+  as.data.frame() -> volcano_data
+
+ggplot(volcano_data, aes(x = log2FoldChange, y = negLogP)) +
+  geom_point(aes(color = is_target), size = 0.75, alpha = 0.75) +
+  scale_color_manual(values = c("Target" = "sienna3", "Other" = "black")) +
+  geom_text_repel(
+    data = subset(volcano_data, is_target == "Target"),
+    aes(label = gene_name),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.3,
+    point.padding = 0.3,
+    segment.color = "grey50",
+    color = "sienna3") +
+  geom_hline(yintercept = -log10(0.05), color = "blue", linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), color = "blue", linetype = "dashed") +
+  theme_bw() +
+  ggtitle(paste0("Volcano Plot Highlighting ", names(sig_sheet_3)[7], " Genes"))
+```
+
+<!-- ## Interpretation of DE Results -->
+
+<!-- Experimental Design Hypothesis -->
+
+<!--     "IgG" refers to an isotype control antibody, i.e., a negative control treatment. -->
+
+<!--     "PD1" refers to  immune checkpoint blockade treatment with anti-PD-1 antibodies. -->
+
+<!-- This setup suggests the experiment aims to model the effects of PD-1 blockade on tumor-bearing (or obesity-prone) mice, and observe how immune responses and metabolic pathways change. -->
+
+<!-- Here, we group the differentially expressed genes by putative function or role: -->
+
+<!-- A. Immune Checkpoint and T cell Exhaustion Markers -->
+
+<!--     Pdcd1 (PD-1) – the target of the treatment. -->
+
+<!--     Ctla4, Tigit, Tox, Il2rb, Bcl11b, Gimap7, Cd8a, Cd7, Nr4a2 – all associated with T cell differentiation, activation, and exhaustion. -->
+
+<!--     Tox, Nr4a2, and Tigit are canonical markers of exhausted T cells (Tex), particularly in chronic infections and tumors. -->
+
+<!--     Gimap7 is implicated in T cell survival and development. -->
+
+<!--     Cd8a, Cd7 suggest cytotoxic T cell involvement. -->
+
+<!--     Il2rb (CD122) is part of the IL-2/IL-15 signaling axis, important for effector T cell responses. -->
+
+<!--   This strongly supports an immune context where anti-PD-1 therapy modulates T cell states. -->
+
+<!-- B. Immunoglobulin and Antigen Presentation -->
+
+<!--     Ighg2b – an immunoglobulin heavy chain, possibly indicating B cell activity or humoral immune response. -->
+
+<!--     H2-M2 – an MHC class Ib gene involved in antigen presentation. -->
+
+<!--   Suggests adaptive immune system remodeling post anti-PD-1 treatment. -->
+
+<!-- C. Tumor and Stemness Markers -->
+
+<!--     Sox2, Pou2f2 – transcription factors linked to pluripotency and stem-like phenotypes, often seen in cancer stem cells. -->
+
+<!--     Krt19 – a cytokeratin linked to epithelial tumors and often used as a cancer biomarker. -->
+
+<!--     Timp3 – a tissue inhibitor of metalloproteinases, often involved in ECM remodeling and metastasis. -->
+
+<!--   Could reflect changes in tumor cell states or the tumor microenvironment under immune pressure. -->
+
+<!-- D. ECM/Structural/Metabolic Genes -->
+
+<!--     Fbn2, Col1a1, Eln, Slit3, Itga7, Timp3 – involved in extracellular matrix remodeling, which can be related to both tumor progression and adipose tissue remodeling in obesity. -->
+
+<!--     Ccdc3 – a secreted factor enriched in adipocytes, with links to metabolism. -->
+
+<!--     Ptpn22 – linked to autoimmunity and metabolic inflammation. -->
+
+<!--     Cables1 – tumor suppressor roles and links to cell cycle control. -->
+
+<!--     Lrp4 – part of Wnt signaling, important in metabolism and cancer. -->
+
+<!--   These genes hint at cross-talk between immune activity, ECM remodeling, and metabolic state—consistent with obesity influencing tumor-immune interactions. -->
+
+
+<!-- The DE gene list is highly coherent with the hypothesis that: -->
+
+<!--     PD-1 blockade is modifying T cell exhaustion, enhancing cytotoxic responses. -->
+
+<!--     There is tumor-related transcriptional plasticity, potentially affecting stemness and ECM interactions. -->
+
+<!--     The interplay between cancer immunity and obesity/metabolism is present—perhaps via shared inflammatory or stromal pathways. -->
+
+<!-- This would fit in with: -->
+
+<!--     Mouse models of diet-induced obesity and cancer (e.g., breast or colon cancer), where obesity is known to dampen anti-PD-1 response. -->
+
+<!--     The possibility that PD-1 therapy partially restores immune function even in metabolically altered environments. -->
+
+## Saving Outputs
+
+The results are saved as `.rds` and `.xlsx` files for downstream use:
+
+```{r write_data, warning=FALSE, message=FALSE}
+## save table of melanoma GSEA results
+write_xlsx(x = melanoma_gsea_res,
+           path = paste0("./results/", project_name, "_melanoma_signature_GSEA_results_",
+                         Sys.Date(), ".xlsx"))
+
+# Save DE result object
+saveRDS(object = res_data_annotated,
+        file = paste0("./results/", project_name, "_DE_results_annotated_",
+                      Sys.Date(), ".rds"))
+
+# Save an Excel file
+write_xlsx(x = res_data_annotated,
+           path = paste0("./results/", project_name, "_DE_results_annotated_",
+                         Sys.Date(), ".xlsx"))
+```
+
+*Session Info*
+
+```{r sessionInfo}
+sessionInfo()
+```
